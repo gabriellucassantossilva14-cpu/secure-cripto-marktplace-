@@ -1,0 +1,289 @@
+contracts/MarketplaceEscrow.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract MarketplaceEscrow is ReentrancyGuard, Pausable, Ownable {
+    enum OrderStatus { PENDING, PAID, DELIVERED, COMPLETED, DISPUTED, RESOLVED }
+    
+    struct User {
+        address wallet;
+        bool isSeller;
+        bool isBuyer;
+        uint256 totalTransactions;
+        uint256 rating;
+        bytes32 anonymousHash;
+        uint256 registeredAt;
+    }
+    
+    struct Product {
+        uint256 productId;
+        address seller;
+        string ipfsHash;
+        uint256 price;
+        bool active;
+        uint256 createdAt;
+    }
+    
+    struct Order {
+        uint256 orderId;
+        address buyer;
+        address seller;
+        uint256 productId;
+        uint256 amount;
+        OrderStatus status;
+        uint256 createdAt;
+        uint256 confirmedAt;
+        bool deliveryConfirmed;
+    }
+    
+    struct Dispute {
+        uint256 disputeId;
+        uint256 orderId;
+        address initiator;
+        string reason;
+        bool resolved;
+        address resolutionWinner;
+        uint256 createdAt;
+    }
+    
+    mapping(address => User) public users;
+    mapping(uint256 => Product) public products;
+    mapping(uint256 => Order) public orders;
+    mapping(uint256 => Dispute) public disputes;
+    
+    uint256 public productCounter;
+    uint256 public orderCounter;
+    uint256 public disputeCounter;
+    uint256 public platformFeeBalance;
+    
+    uint256 constant PLATFORM_FEE_PERCENTAGE = 50;
+    uint256 constant DENOMINATOR = 10000;
+    uint256 constant RELEASE_DELAY = 7 days;
+    
+    event UserRegistered(address indexed user, bool isSeller, bool isBuyer);
+    event ProductListed(uint256 indexed productId, address indexed seller, uint256 price);
+    event OrderCreated(uint256 indexed orderId, address indexed buyer, address indexed seller, uint256 amount);
+    event DeliveryConfirmed(uint256 indexed orderId, address indexed buyer);
+    event FundsReleased(uint256 indexed orderId, address indexed seller, uint256 amount);
+    event DisputeRaised(uint256 indexed disputeId, uint256 indexed orderId, address indexed initiator);
+    event DisputeResolved(uint256 indexed disputeId, address indexed winner, uint256 amount);
+    event FeeWithdrawn(uint256 amount);
+    
+    modifier onlyRegisteredSeller() {
+        require(users[msg.sender].isSeller, "Not a registered seller");
+        _;
+    }
+    
+    modifier onlyRegisteredBuyer() {
+        require(users[msg.sender].isBuyer, "Not a registered buyer");
+        _;
+    }
+    
+    function registerSeller(bytes32 anonymousHash) external {
+        require(!users[msg.sender].isSeller, "Already registered as seller");
+        
+        users[msg.sender] = User({
+            wallet: msg.sender,
+            isSeller: true,
+            isBuyer: false,
+            totalTransactions: 0,
+            rating: 0,
+            anonymousHash: anonymousHash,
+            registeredAt: block.timestamp
+        });
+        
+        emit UserRegistered(msg.sender, true, false);
+    }
+    
+    function registerBuyer() external {
+        require(!users[msg.sender].isBuyer, "Already registered as buyer");
+        
+        users[msg.sender] = User({
+            wallet: msg.sender,
+            isSeller: false,
+            isBuyer: true,
+            totalTransactions: 0,
+            rating: 0,
+            anonymousHash: bytes32(0),
+            registeredAt: block.timestamp
+        });
+        
+        emit UserRegistered(msg.sender, false, true);
+    }
+    
+    function listProduct(string calldata ipfsHash, uint256 price) external onlyRegisteredSeller returns (uint256) {
+        require(price > 0, "Price must be greater than 0");
+        require(bytes(ipfsHash).length > 0, "IPFS hash required");
+        
+        productCounter++;
+        
+        products[productCounter] = Product({
+            productId: productCounter,
+            seller: msg.sender,
+            ipfsHash: ipfsHash,
+            price: price,
+            active: true,
+            createdAt: block.timestamp
+        });
+        
+        emit ProductListed(productCounter, msg.sender, price);
+        return productCounter;
+    }
+    
+    function createOrder(uint256 productId) external payable onlyRegisteredBuyer nonReentrant whenNotPaused returns (uint256) {
+        Product memory product = products[productId];
+        require(product.active, "Product not available");
+        require(msg.value == product.price, "Incorrect payment amount");
+        
+        orderCounter++;
+        
+        uint256 platformFee = (msg.value * PLATFORM_FEE_PERCENTAGE) / DENOMINATOR;
+        platformFeeBalance += platformFee;
+        
+        orders[orderCounter] = Order({
+            orderId: orderCounter,
+            buyer: msg.sender,
+            seller: product.seller,
+            productId: productId,
+            amount: msg.value - platformFee,
+            status: OrderStatus.PAID,
+            createdAt: block.timestamp,
+            confirmedAt: 0,
+            deliveryConfirmed: false
+        });
+        
+        users[msg.sender].totalTransactions++;
+        users[product.seller].totalTransactions++;
+        
+        emit OrderCreated(orderCounter, msg.sender, product.seller, msg.value - platformFee);
+        return orderCounter;
+    }
+    
+    function confirmDelivery(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        require(order.buyer == msg.sender, "Only buyer can confirm delivery");
+        require(order.status == OrderStatus.PAID, "Invalid order status");
+        
+        order.deliveryConfirmed = true;
+        order.confirmedAt = block.timestamp;
+        order.status = OrderStatus.DELIVERED;
+        
+        emit DeliveryConfirmed(orderId, msg.sender);
+    }
+    
+    function releaseFunds(uint256 orderId) external nonReentrant {
+        Order storage order = orders[orderId];
+        require(order.seller == msg.sender || msg.sender == owner(), "Unauthorized");
+        require(order.status == OrderStatus.DELIVERED, "Delivery not confirmed");
+        require(order.status != OrderStatus.COMPLETED, "Funds already released");
+        
+        uint256 amount = order.amount;
+        order.status = OrderStatus.COMPLETED;
+        
+        (bool success, ) = payable(order.seller).call{value: amount}("");
+        require(success, "Transfer failed");
+        
+        emit FundsReleased(orderId, order.seller, amount);
+    }
+    
+    function autoReleaseFunds(uint256 orderId) external nonReentrant {
+        Order storage order = orders[orderId];
+        require(order.status == OrderStatus.DELIVERED, "Order not delivered");
+        require(block.timestamp >= order.confirmedAt + RELEASE_DELAY, "Hold period not met");
+        require(order.status != OrderStatus.COMPLETED, "Already completed");
+        
+        uint256 amount = order.amount;
+        order.status = OrderStatus.COMPLETED;
+        
+        (bool success, ) = payable(order.seller).call{value: amount}("");
+        require(success, "Transfer failed");
+        
+        emit FundsReleased(orderId, order.seller, amount);
+    }
+    
+    function raiseDispute(uint256 orderId, string calldata reason) external returns (uint256) {
+        Order memory order = orders[orderId];
+        require(msg.sender == order.buyer || msg.sender == order.seller, "Not order participant");
+        require(order.status != OrderStatus.COMPLETED, "Cannot dispute completed order");
+        
+        disputeCounter++;
+        
+        disputes[disputeCounter] = Dispute({
+            disputeId: disputeCounter,
+            orderId: orderId,
+            initiator: msg.sender,
+            reason: reason,
+            resolved: false,
+            resolutionWinner: address(0),
+            createdAt: block.timestamp
+        });
+        
+        orders[orderId].status = OrderStatus.DISPUTED;
+        
+        emit DisputeRaised(disputeCounter, orderId, msg.sender);
+        return disputeCounter;
+    }
+    
+    function resolveDispute(uint256 disputeId, address winner) external onlyOwner nonReentrant {
+        Dispute storage dispute = disputes[disputeId];
+        require(!dispute.resolved, "Dispute already resolved");
+        
+        Order storage order = orders[dispute.orderId];
+        require(order.status == OrderStatus.DISPUTED, "Order not disputed");
+        
+        dispute.resolved = true;
+        dispute.resolutionWinner = winner;
+        order.status = OrderStatus.RESOLVED;
+        
+        uint256 amount = order.amount;
+        
+        (bool success, ) = payable(winner).call{value: amount}("");
+        require(success, "Transfer failed");
+        
+        emit DisputeResolved(disputeId, winner, amount);
+    }
+    
+    function withdrawPlatformFees(uint256 amount) external onlyOwner nonReentrant {
+        require(amount <= platformFeeBalance, "Insufficient fee balance");
+        
+        platformFeeBalance -= amount;
+        
+        (bool success, ) = payable(owner()).call{value: amount}("");
+        require(success, "Withdrawal failed");
+        
+        emit FeeWithdrawn(amount);
+    }
+    
+    function getProductDetails(uint256 productId) external view returns (Product memory) {
+        return products[productId];
+    }
+    
+    function getOrderDetails(uint256 orderId) external view returns (Order memory) {
+        return orders[orderId];
+    }
+    
+    function getUserStats(address userAddress) external view returns (
+        bool isSeller,
+        bool isBuyer,
+        uint256 totalTransactions,
+        uint256 rating
+    ) {
+        User memory user = users[userAddress];
+        return (user.isSeller, user.isBuyer, user.totalTransactions, user.rating);
+    }
+    
+    function pause() external onlyOwner {
+        _pause();
+    }
+    
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+    
+    receive() external payable {}
+}
